@@ -137,6 +137,7 @@ DOMAIN_SENTINEL_ALLOWED_DOMAINS = frozenset(
         "general",
     }
 )
+CHAT_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 SEMANTIC_RESCUE_SYSTEM_PROMPT = """You are a strict memory evidence verifier.
 Select at most one candidate only when its content directly supports the user's current query on one provided axis.
@@ -1844,6 +1845,7 @@ class GatewayService:
                 status_code=400,
             )
 
+        request_id: str | None = None
         logger.info(
             "Gateway incoming chat | session=%s model=%s stream=%s messages=%s",
             session_id,
@@ -1853,6 +1855,7 @@ class GatewayService:
         )
 
         try:
+            request_id = self._pop_chat_request_id(payload)
             payload, marker_favorite = self._strip_favorite_memory_marker_from_payload(payload)
             include_favorite_memory = marker_favorite or self._truthy_header(
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
@@ -1869,12 +1872,31 @@ class GatewayService:
                     else "compact"
                 ),
             )
+            if request_id and isinstance(injection_debug, dict):
+                injection_debug["request_id"] = request_id
         except ValueError as exc:
+            if request_id:
+                return self._safe_chat_error_response(
+                    request_id,
+                    status_code=400,
+                    stage="request",
+                    code="invalid_request",
+                    message="Request is invalid",
+                    error_type="invalid_request_error",
+                )
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "invalid_request_error"}},
                 status_code=400,
             )
         except RuntimeError as exc:
+            if request_id:
+                return self._safe_chat_error_response(
+                    request_id,
+                    status_code=503,
+                    stage="gateway",
+                    code="gateway_unavailable",
+                    message="Gateway is temporarily unavailable",
+                )
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "server_error"}},
                 status_code=503,
@@ -1882,7 +1904,7 @@ class GatewayService:
 
         if forward_payload.get("stream") is True:
             try:
-                return await self._stream_upstream(
+                stream_response = await self._stream_upstream(
                     forward_payload,
                     session_id,
                     recalled_ids,
@@ -1890,7 +1912,18 @@ class GatewayService:
                     client_label,
                     injection_debug,
                 )
+                if request_id:
+                    stream_response.headers["X-Request-Id"] = request_id
+                return stream_response
             except RuntimeError as exc:
+                if request_id:
+                    return self._safe_chat_error_response(
+                        request_id,
+                        status_code=503,
+                        stage="gateway",
+                        code="gateway_unavailable",
+                        message="Gateway is temporarily unavailable",
+                    )
                 return JSONResponse(
                     {"error": {"message": str(exc), "type": "server_error"}},
                     status_code=503,
@@ -1909,7 +1942,7 @@ class GatewayService:
                 assistant_message = self._extract_assistant_message_from_anthropic_response(upstream_response)
                 if assistant_message:
                     self._update_reasoning_cache(session_id, assistant_message)
-                await self._record_successful_round(
+                round_id = await self._record_successful_round(
                     session_id,
                     recalled_ids,
                     injection_debug,
@@ -1926,11 +1959,28 @@ class GatewayService:
                     assistant_message,
                     recalled_ids or [],
                 )
-                return self._anthropic_response_to_openai(upstream_response, forward_payload["model"])
+                response = self._anthropic_response_to_openai(upstream_response, forward_payload["model"])
+                return self._attach_chat_diagnostics(
+                    response,
+                    request_id=request_id,
+                    round_id=round_id,
+                    injection_debug=injection_debug,
+                    upstream_usage=upstream_usage,
+                )
 
+            if request_id:
+                return self._safe_chat_error_response(
+                    request_id,
+                    status_code=502,
+                    stage="upstream",
+                    code="upstream_error",
+                    message="Upstream model request failed",
+                )
             return self._proxy_response(upstream_response)
 
         upstream_response = await self._forward_upstream(forward_payload)
+        upstream_usage = None
+        round_id = None
         if 200 <= upstream_response.status_code < 300:
             upstream_response, memory_detail_debug = await self._maybe_retry_with_memory_detail(
                 forward_payload=forward_payload,
@@ -1947,7 +1997,7 @@ class GatewayService:
             )
             self._capture_reasoning_from_response(session_id, upstream_response)
             assistant_message = self._extract_assistant_message_from_response(upstream_response)
-            await self._record_successful_round(
+            round_id = await self._record_successful_round(
                 session_id,
                 recalled_ids,
                 injection_debug,
@@ -1965,7 +2015,21 @@ class GatewayService:
                 recalled_ids or [],
             )
 
-        return self._proxy_response(upstream_response)
+        if not 200 <= upstream_response.status_code < 300 and request_id:
+            return self._safe_chat_error_response(
+                request_id,
+                status_code=502,
+                stage="upstream",
+                code="upstream_error",
+                message="Upstream model request failed",
+            )
+        return self._attach_chat_diagnostics(
+            self._proxy_response(upstream_response),
+            request_id=request_id,
+            round_id=round_id,
+            injection_debug=injection_debug,
+            upstream_usage=upstream_usage,
+        )
 
     async def handle_anthropic_messages(self, request: Request) -> Response:
         auth_result = self._authorize_anthropic_request(request)
@@ -3825,20 +3889,20 @@ class GatewayService:
         client: str = "",
         route: str = "",
         upstream_usage: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> int | None:
         if recalled_ids is None:
             logger.info(
                 "Gateway round bookkeeping skipped | session=%s reason=not_current_user_turn",
                 session_id,
             )
-            return
+            return None
         if not self._assistant_message_has_output(assistant_message):
             logger.warning(
                 "Gateway round bookkeeping skipped | session=%s route=%s reason=no_assistant_output",
                 session_id,
                 route,
             )
-            return
+            return None
         round_id = self.state_store.record_success(session_id, recalled_ids)
         if injection_debug and injection_debug.get("recent_context_injected"):
             try:
@@ -3911,6 +3975,7 @@ class GatewayService:
             round_id,
             recalled_ids,
         )
+        return round_id
 
     @staticmethod
     def _assistant_message_has_output(assistant_message: dict[str, Any] | None) -> bool:
@@ -5080,6 +5145,150 @@ class GatewayService:
                 arguments = arguments[:157] + "..."
             parts.append(f"{name}({arguments})")
         return "; ".join(parts)
+
+    @staticmethod
+    def _pop_chat_request_id(payload: dict[str, Any]) -> str | None:
+        raw_request_id = payload.pop("request_id", None)
+        if raw_request_id is None:
+            return None
+        if not isinstance(raw_request_id, str) or not CHAT_REQUEST_ID_RE.fullmatch(raw_request_id):
+            raise ValueError("request_id must be a safe string no longer than 128 characters")
+        return raw_request_id
+
+    @staticmethod
+    def _safe_chat_error_response(
+        request_id: str,
+        *,
+        status_code: int,
+        stage: str,
+        code: str,
+        message: str,
+        error_type: str = "server_error",
+    ) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": {"message": message, "type": error_type},
+                "request_id": request_id,
+                "error_stage": stage,
+                "error_code": code,
+            },
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _actual_token_count(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+            return int(value.strip())
+        return None
+
+    @classmethod
+    def _actual_usage_diagnostics(cls, usage: dict[str, Any] | None) -> dict[str, int | None]:
+        safe_usage = usage if isinstance(usage, dict) else {}
+
+        def first_actual(*keys: str) -> int | None:
+            for key in keys:
+                value = cls._actual_token_count(safe_usage.get(key))
+                if value is not None:
+                    return value
+            return None
+
+        prompt_details = safe_usage.get("prompt_tokens_details")
+        cached_tokens = None
+        if isinstance(prompt_details, dict):
+            cached_tokens = cls._actual_token_count(prompt_details.get("cached_tokens"))
+        if cached_tokens is None:
+            cached_tokens = first_actual("cached_tokens")
+
+        return {
+            "input_tokens": first_actual("prompt_tokens", "input_tokens"),
+            "output_tokens": first_actual("completion_tokens", "output_tokens"),
+            "total_tokens": first_actual("total_tokens"),
+            "cached_tokens": cached_tokens,
+            "prompt_cache_hit_tokens": first_actual("prompt_cache_hit_tokens"),
+            "prompt_cache_miss_tokens": first_actual("prompt_cache_miss_tokens"),
+            "cache_read_input_tokens": first_actual("cache_read_input_tokens"),
+            "cache_creation_input_tokens": first_actual("cache_creation_input_tokens"),
+        }
+
+    @staticmethod
+    def _actual_debug_id_count(debug: dict[str, Any] | None, key: str) -> int | None:
+        if not isinstance(debug, dict) or key not in debug:
+            return None
+        values = debug.get(key)
+        if not isinstance(values, list):
+            return None
+        return len({value for value in values if isinstance(value, str) and value.strip()})
+
+    @classmethod
+    def _public_chat_diagnostics(
+        cls,
+        *,
+        round_id: int | None,
+        injection_debug: dict[str, Any] | None,
+        upstream_usage: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        recent_context_injected = None
+        if isinstance(injection_debug, dict) and isinstance(
+            injection_debug.get("recent_context_injected"), bool
+        ):
+            recent_context_injected = injection_debug["recent_context_injected"]
+        return {
+            "gateway_round": round_id if isinstance(round_id, int) and round_id >= 0 else None,
+            "recent_context_injected": recent_context_injected,
+            "memory": {
+                "recalled_count": cls._actual_debug_id_count(injection_debug, "recalled_bucket_ids"),
+                "diffused_count": cls._actual_debug_id_count(injection_debug, "diffused_bucket_ids"),
+                "injected_count": cls._actual_debug_id_count(injection_debug, "injected_bucket_ids"),
+            },
+            "usage": cls._actual_usage_diagnostics(upstream_usage),
+        }
+
+    @classmethod
+    def _attach_chat_diagnostics(
+        cls,
+        response: Response,
+        *,
+        request_id: str | None,
+        round_id: int | None,
+        injection_debug: dict[str, Any] | None,
+        upstream_usage: dict[str, Any] | None,
+    ) -> Response:
+        if not 200 <= response.status_code < 300:
+            if request_id:
+                return cls._safe_chat_error_response(
+                    request_id,
+                    status_code=502,
+                    stage="upstream",
+                    code="upstream_invalid_response",
+                    message="Upstream model response was invalid",
+                )
+            return response
+        try:
+            body = json.loads(response.body)
+        except (AttributeError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            if request_id:
+                return cls._safe_chat_error_response(
+                    request_id,
+                    status_code=502,
+                    stage="upstream",
+                    code="upstream_invalid_response",
+                    message="Upstream model response was invalid",
+                )
+            return response
+        if not isinstance(body, dict):
+            return response
+        if request_id:
+            body["request_id"] = request_id
+        body["diagnostics"] = cls._public_chat_diagnostics(
+            round_id=round_id,
+            injection_debug=injection_debug,
+            upstream_usage=upstream_usage,
+        )
+        return JSONResponse(body, status_code=response.status_code)
 
     def _log_cache_usage_from_response(
         self,
