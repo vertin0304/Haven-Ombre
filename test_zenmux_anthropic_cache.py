@@ -9,7 +9,10 @@ from gateway import GatewayService
 
 
 ZENMUX_ANTHROPIC_BASE_URL = "https://zenmux.ai/api/anthropic"
-MODEL_PLACEHOLDER = "ZENMUX_MODEL_PLACEHOLDER"
+SONNET_ALIAS = "cc-home-claude-sonnet"
+SONNET_MODEL = "anthropic/claude-sonnet-4.6"
+OPUS_ALIAS = "cc-home-claude-opus"
+OPUS_MODEL = "anthropic/claude-opus-4.6"
 REQUEST_ID = "019d3fd2-44a6-7c64-8e0d-455658bbb09d"
 
 
@@ -24,10 +27,10 @@ def build_service():
 
 def zenmux_route():
     return {
-        "public_model": "zenmux-anthropic-cache-test-placeholder",
-        "upstream_model": MODEL_PLACEHOLDER,
+        "public_model": SONNET_ALIAS,
+        "upstream_model": SONNET_MODEL,
         "upstream": {
-            "name": "zenmux-anthropic-cache-test",
+            "name": "zenmux-anthropic",
             "base_url": ZENMUX_ANTHROPIC_BASE_URL,
             "protocol": "anthropic",
             "prompt_cache": "anthropic_explicit",
@@ -42,7 +45,7 @@ def cache_test_payload():
     long_tail = "current-turn-tail " * 5_000
     return {
         "request_id": REQUEST_ID,
-        "model": "zenmux-anthropic-cache-test-placeholder",
+        "model": SONNET_ALIAS,
         "messages": [
             {"role": "system", "content": "stable-system-marker"},
             {"role": "user", "content": long_prefix},
@@ -213,3 +216,89 @@ def test_cache_strategy_is_scoped_to_the_selected_upstream():
     assert "cache_control" not in forwarded
     assert all("cache_control" not in tool for tool in forwarded["tools"])
     assert all("cache_control" not in json.dumps(message) for message in forwarded["messages"])
+
+
+def build_multi_upstream_service():
+    service = build_service()
+    service.gateway_cfg = {
+        "upstream_default_model": "cc-home-default",
+        "upstreams": [
+            {
+                "name": "existing-provider-placeholder",
+                "protocol": "openai",
+                "base_url": "https://existing-provider.example.invalid/v1",
+                "api_key": "fake-existing-provider-key",
+                "default_model": "cc-home-default",
+                "models": [
+                    {
+                        "id": "cc-home-default",
+                        "upstream_model": "existing-model-placeholder",
+                    }
+                ],
+            },
+            {
+                "name": "zenmux-anthropic",
+                "protocol": "anthropic",
+                "base_url": ZENMUX_ANTHROPIC_BASE_URL,
+                "api_key": "fake-zenmux-test-placeholder",
+                "default_model": SONNET_ALIAS,
+                "prompt_cache": "anthropic_explicit",
+                "models": [
+                    {"id": SONNET_ALIAS, "upstream_model": SONNET_MODEL},
+                    {"id": OPUS_ALIAS, "upstream_model": OPUS_MODEL},
+                ],
+            },
+        ],
+    }
+    service.upstream_base_url = ""
+    service.upstream_default_model = "cc-home-default"
+    service.upstream_models = []
+    service.upstream_api_key = ""
+    service.upstreams = service._load_upstreams()
+    service._refresh_upstream_model_summary()
+    return service
+
+
+def test_public_aliases_route_without_replacing_existing_provider():
+    service = build_multi_upstream_service()
+
+    assert service.upstream_models == [
+        "cc-home-default",
+        SONNET_ALIAS,
+        OPUS_ALIAS,
+    ]
+
+    default_route = service._resolve_upstream_for_model("cc-home-default")
+    assert default_route["upstream"]["name"] == "existing-provider-placeholder"
+    assert default_route["upstream_model"] == "existing-model-placeholder"
+
+    sonnet_route = service._resolve_upstream_for_model(SONNET_ALIAS)
+    assert sonnet_route["upstream"]["name"] == "zenmux-anthropic"
+    assert sonnet_route["upstream_model"] == SONNET_MODEL
+
+    opus_route = service._resolve_upstream_for_model(OPUS_ALIAS)
+    assert opus_route["upstream"]["name"] == "zenmux-anthropic"
+    assert opus_route["upstream_model"] == OPUS_MODEL
+
+
+@pytest.mark.asyncio
+async def test_model_list_exposes_only_public_aliases():
+    service = build_multi_upstream_service()
+    service.gateway_token = "fake-gateway-token"
+    request = SimpleNamespace(
+        headers={"Authorization": "Bearer fake-gateway-token"}
+    )
+
+    response = await service.handle_models(request)
+    body = json.loads(response.body)
+    serialized = json.dumps(body)
+
+    assert [item["id"] for item in body["data"]] == [
+        "cc-home-default",
+        SONNET_ALIAS,
+        OPUS_ALIAS,
+    ]
+    assert "zenmux.ai" not in serialized
+    assert "fake-" not in serialized
+    assert SONNET_MODEL not in serialized
+    assert OPUS_MODEL not in serialized
