@@ -354,6 +354,21 @@ gateway:
   #     models:
   #       - id: "claude-sonnet"
   #         upstream_model: "claude-sonnet-4-6"
+  # ZenMux Anthropic explicit-cache test template. Keep the real key only in the
+  # deployment environment, and replace the model placeholder deliberately.
+  # ZenMux Anthropic 显式缓存测试模板。真实密钥只放部署环境，模型名需明确替换占位符。
+  #   - name: "zenmux-anthropic-cache-test"
+  #     protocol: "anthropic"
+  #     base_url: "https://zenmux.ai/api/anthropic"
+  #     api_key_env: "OMBRE_GATEWAY_ZENMUX_API_KEY"
+  #     anthropic_version: "2023-06-01"
+  #     prompt_cache: "anthropic_explicit"
+  #     # Omit prompt_cache_retention to use the default 5-minute cache.
+  #     # 不配置 prompt_cache_retention，即使用默认 5 分钟缓存。
+  #     default_model: "ZENMUX_MODEL_PLACEHOLDER"
+  #     models:
+  #       - id: "zenmux-anthropic-cache-test-placeholder"
+  #         upstream_model: "ZENMUX_MODEL_PLACEHOLDER"
   head_recent_hours: 72
   recent_context_reentry_idle_hours: 24
   recent_context_cooldown_hours: 6
