@@ -3524,7 +3524,7 @@ class GatewayService:
         upstream = route["upstream"]
         model = route["public_model"]
         upstream_payload = self._anthropic_payload_for_upstream(payload, route)
-        url = f"{upstream['base_url']}/messages"
+        url = self._anthropic_messages_url(upstream)
         key_entries = self._available_upstream_api_keys(upstream)
         last_error: Exception | None = None
         last_response: httpx.Response | None = None
@@ -3671,7 +3671,7 @@ class GatewayService:
         model = route["public_model"]
         upstream_payload = self._anthropic_payload_for_upstream(payload, route)
         upstream_payload["stream"] = True
-        url = f"{upstream['base_url']}/messages"
+        url = self._anthropic_messages_url(upstream)
         key_entries = self._available_upstream_api_keys(upstream)
         last_error: Exception | None = None
         last_response: httpx.Response | None = None
@@ -3738,6 +3738,17 @@ class GatewayService:
         if last_response is not None:
             return last_response
         return self._upstream_request_error_response(upstream, model, last_error)
+
+    @staticmethod
+    def _anthropic_messages_url(upstream: dict[str, Any]) -> str:
+        base_url = str(upstream.get("base_url") or "").strip().rstrip("/")
+        if base_url.endswith("/messages"):
+            return base_url
+        if base_url.endswith("/v1"):
+            return f"{base_url}/messages"
+        if base_url.endswith("/api/anthropic"):
+            return f"{base_url}/v1/messages"
+        return f"{base_url}/messages"
 
     async def _stream_upstream(
         self,
