@@ -2706,6 +2706,7 @@ class GatewayService:
         stage_started_at = time.perf_counter()
         current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
+        current_time_context = self._current_time_context() if is_new_user_turn else ""
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
@@ -3232,6 +3233,7 @@ class GatewayService:
             memory_detail_recall_instruction=memory_detail_recall_instruction,
             handoff_tool_hint=handoff_tool_hint,
             context_mode=context_mode,
+            current_time_context=current_time_context,
         )
         mark_step("build_context_messages", stage_started_at)
 
@@ -6007,7 +6009,6 @@ class GatewayService:
         self._apply_explicit_anthropic_cache_control(
             payload,
             cache_control,
-            model=str(payload.get("model") or ""),
         )
 
     def _anthropic_cache_control(self, upstream: dict[str, Any]) -> dict[str, str]:
@@ -6025,7 +6026,6 @@ class GatewayService:
         self,
         payload: dict[str, Any],
         cache_control: dict[str, str],
-        model: str = "",
     ) -> None:
         self._attach_cache_control_to_anthropic_content(payload, "system", cache_control)
         self._attach_cache_control_to_anthropic_tools(payload, cache_control)
@@ -6033,79 +6033,21 @@ class GatewayService:
         if not isinstance(messages, list):
             return
 
-        breakpoint_index = self._find_cache_breakpoint(messages, model=model)
+        breakpoint_index = self._find_cache_breakpoint(messages)
         if breakpoint_index is None:
             return
         message = messages[breakpoint_index]
         if isinstance(message, dict):
             self._attach_cache_control_to_anthropic_content(message, "content", cache_control)
 
-    @staticmethod
-    def _cache_min_tokens_for_model(model: str) -> int:
-        lowered = str(model or "").lower()
-        if "sonnet" in lowered:
-            return 2048
-        return 4096
-
-    @staticmethod
-    def _cache_tail_tokens_for_model(model: str) -> int:
-        return 4000
-
-    def _find_cache_breakpoint(self, messages: list[Any], *, model: str = "") -> int | None:
+    def _find_cache_breakpoint(self, messages: list[Any]) -> int | None:
         if not isinstance(messages, list) or len(messages) < 3:
             return None
-        min_tokens = self._cache_min_tokens_for_model(model)
-        tail_target = self._cache_tail_tokens_for_model(model)
-        estimates = [
-            self._anthropic_message_token_estimate(message)
-            if isinstance(message, dict)
-            else count_tokens_approx(str(message or ""))
-            for message in messages
-        ]
-        prefix_tokens = sum(estimates)
-        tail_tokens = 0
         for index in range(len(messages) - 2, -1, -1):
-            tail_tokens += estimates[index + 1]
-            prefix_tokens -= estimates[index + 1]
             message = messages[index]
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            if prefix_tokens >= min_tokens and tail_tokens >= tail_target:
+            if isinstance(message, dict) and message.get("role") == "assistant":
                 return index
         return None
-
-    def _anthropic_message_token_estimate(self, message: dict[str, Any]) -> int:
-        if not isinstance(message, dict):
-            return 0
-        return count_tokens_approx(
-            " ".join(
-                part
-                for part in (
-                    str(message.get("role") or ""),
-                    self._anthropic_content_text(message.get("content")),
-                )
-                if part
-            )
-        )
-
-    def _anthropic_content_text(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                elif isinstance(block, dict):
-                    text = block.get("text")
-                    if text is not None:
-                        parts.append(str(text))
-                    else:
-                        parts.append(json.dumps(block, ensure_ascii=False, sort_keys=True, default=str))
-            return "\n".join(parts)
-        if content is None:
-            return ""
-        return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
 
     def _attach_cache_control_to_anthropic_tools(
         self,
@@ -18032,6 +17974,7 @@ class GatewayService:
         context_mode: str = "",
         date_persona_trace: str = "",
         date_recall: str = "",
+        current_time_context: str = "",
     ) -> tuple[str, str]:
         has_dynamic_context = any(
             section.strip()
@@ -18052,6 +17995,7 @@ class GatewayService:
                 dream_context,
                 active_reminders,
                 context_mode,
+                current_time_context,
             ]
         )
         has_memory_reading_context = any(
@@ -18095,6 +18039,7 @@ class GatewayService:
                     dynamic_sections.extend(["", title, content])
 
             add_section("Just Now Chat Context", just_now_context)
+            add_section("Current Local Time", current_time_context)
             add_section("Date Recall", date_recall)
             add_section("Context Mode", f"context_mode: {context_mode}" if context_mode.strip() else "")
             add_section("照顾备忘", active_reminders)
@@ -18137,6 +18082,21 @@ class GatewayService:
             return self._trim_text(stable_context, self.inject_total_budget), ""
         remaining = max(0, self.inject_total_budget - stable_tokens)
         return stable_context, self._trim_text(dynamic_context, remaining)
+
+    def _current_time_context(self, now: datetime | None = None) -> str:
+        local_now = now or datetime.now(self.gateway_tz)
+        if local_now.tzinfo is None:
+            local_now = local_now.replace(tzinfo=self.gateway_tz)
+        else:
+            local_now = local_now.astimezone(self.gateway_tz)
+        weekday = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")[
+            local_now.weekday()
+        ]
+        timezone_name = str(getattr(self.gateway_tz, "key", "") or self.gateway_tz)
+        return (
+            f"{local_now:%Y-%m-%d %H:%M}, {weekday} ({timezone_name}). "
+            "Treat this as authoritative for the current turn, but mention it only when relevant."
+        )
 
     @staticmethod
     def _memory_reading_policy_context() -> str:
