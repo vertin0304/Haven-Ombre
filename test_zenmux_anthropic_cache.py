@@ -1,6 +1,8 @@
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -192,6 +194,54 @@ def test_identity_persona_recent_and_recall_keep_current_injection_order():
     assert injected[3]["content"].startswith("<ombre_live_context>")
     assert injected[3]["content"].endswith("current-user-marker")
     assert original[-1]["content"] == "current-user-marker"
+
+
+def test_current_shanghai_time_is_dynamic_and_authoritative():
+    service = build_service()
+    service.gateway_tz = ZoneInfo("Asia/Shanghai")
+    current_time = service._current_time_context(
+        datetime(2026, 8, 23, 7, 25, tzinfo=timezone.utc)
+    )
+
+    stable, dynamic = service._build_injected_context_messages(
+        persona_block="persona-marker",
+        core_memory="core-marker",
+        portrait_memory="",
+        current_time_context=current_time,
+    )
+
+    assert "2026-08-23 15:25" in current_time
+    assert "Sunday (Asia/Shanghai)" in current_time
+    assert current_time not in stable
+    assert "Current Local Time" in dynamic
+    assert current_time in dynamic
+    injected = service._inject_context_messages(
+        [{"role": "user", "content": "current-user-marker"}],
+        stable,
+        dynamic,
+    )
+    assert current_time not in injected[0]["content"]
+    assert current_time in injected[-1]["content"]
+
+
+def test_short_chat_marks_latest_completed_assistant_as_cache_breakpoint():
+    service = build_service()
+    route = zenmux_route()
+    payload = {
+        "model": SONNET_ALIAS,
+        "messages": [
+            {"role": "user", "content": "first short question"},
+            {"role": "assistant", "content": "first short answer"},
+            {"role": "user", "content": "second short question"},
+        ],
+    }
+
+    forwarded = service._anthropic_payload_for_upstream(payload, route)
+
+    assert cache_control_from_content(forwarded["messages"][1]["content"]) == {
+        "type": "ephemeral"
+    }
+    assert "cache_control" not in json.dumps(forwarded["messages"][2])
 
 
 def test_real_cache_usage_is_returned_and_missing_values_stay_null():
