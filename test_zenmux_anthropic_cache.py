@@ -125,7 +125,7 @@ async def test_zenmux_anthropic_messages_uses_explicit_five_minute_cache_once():
     assert response.status_code == 200
     assert post.await_count == 1
     call = post.await_args
-    assert call.args[0] == f"{ZENMUX_ANTHROPIC_BASE_URL}/messages"
+    assert call.args[0] == f"{ZENMUX_ANTHROPIC_BASE_URL}/v1/messages"
     forwarded = call.kwargs["json"]
     assert REQUEST_ID not in json.dumps(forwarded)
     assert cache_control_from_content(forwarded["system"]) == {"type": "ephemeral"}
@@ -135,6 +135,31 @@ async def test_zenmux_anthropic_messages_uses_explicit_five_minute_cache_once():
     )
     assert cache_control_from_content(history_assistant["content"]) == {"type": "ephemeral"}
     assert "ttl" not in json.dumps(forwarded)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (
+            "https://zenmux.ai/api/anthropic",
+            "https://zenmux.ai/api/anthropic/v1/messages",
+        ),
+        (
+            "https://api.anthropic.example.invalid/v1",
+            "https://api.anthropic.example.invalid/v1/messages",
+        ),
+        (
+            "https://legacy-anthropic.example.invalid/api",
+            "https://legacy-anthropic.example.invalid/api/messages",
+        ),
+        (
+            "https://custom-anthropic.example.invalid/v1/messages/",
+            "https://custom-anthropic.example.invalid/v1/messages",
+        ),
+    ],
+)
+def test_anthropic_messages_url_preserves_other_provider_conventions(base_url, expected):
+    assert GatewayService._anthropic_messages_url({"base_url": base_url}) == expected
 
 
 def test_identity_persona_recent_and_recall_keep_current_injection_order():
